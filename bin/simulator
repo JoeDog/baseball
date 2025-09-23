@@ -1,0 +1,964 @@
+#!/usr/bin/env python3
+import os
+import re
+import sys
+import argparse
+import heapq
+import math
+import random
+import sqlite3
+import time
+import itertools
+import hashlib
+import numpy as np
+from   textwrap import dedent
+
+def h64(*parts) -> int:
+  """Deterministic 64-bit hash from mixed parts (ints/str/SeedSequence)."""
+  def norm(x):
+    if isinstance(x, (int, float)):
+      return str(int(x))
+    return str(x)
+  s = "|".join(norm(p) for p in parts)
+  return int(hashlib.blake2b(s.encode('utf-8'), digest_size=8).hexdigest(), 16)
+
+def _h64(*parts) -> int:
+  s = "|".join(map(str, parts))
+  return int(hashlib.blake2b(s.encode(), digest_size=8).hexdigest(), 16)
+
+class PlayerData(object):
+  DATABASE = os.path.dirname(os.path.realpath(__file__))+"/../data/baseball.db"
+ 
+  def __init__(self):
+    self.dbh = sqlite3.connect(self.DATABASE)
+    self.dbh.row_factory = sqlite3.Row 
+    self.batters = self._batters()
+
+  def find(self, ident, partial=False):
+    """
+    Search for a batter record by UID, name, or a custom callable.
+
+    This method searches the list of batters (`self.batters`) using one of
+    three criteria:
+    
+    - If `ident` is an integer, it will match against the batter's `uid`.
+    - If `ident` is a string:
+        - If `partial` is `False` (default), it performs a case-insensitive exact match against `name`.
+        - If `partial` is `True`, it checks whether `ident` is a case-insensitive substring of the name.
+    - If `ident` is a callable (e.g., a lambda), it will use that function as a predicate to evaluate each batter.
+
+    Args:
+        ident (int | str | callable): The identifier used to find a batter.
+            - `int`: UID of the batter.
+            - `str`: Full or partial name of the batter (depending on `partial`).
+            - `callable`: A function that takes a batter dict and returns `True` if it matches.
+        partial (bool, optional): Whether to perform a partial name match when `ident` is a string.
+            Defaults to `False`.
+
+    Returns:
+        dict | None: The first matching batter dictionary, or `None` if no match is found.
+
+    Examples:
+        >>> self.find(123)
+        {'uid': 123, 'name': 'Barry Bonds', ...}
+
+        >>> self.find("Barry Bonds")
+        {'uid': 123, 'name': 'Barry Bonds', ...}
+
+        >>> self.find("Bonds", partial=True)
+        {'uid': 123, 'name': 'Barry Bonds', ...}
+
+        >>> self.find(lambda b: b['hr'] > 50 and b['team'] == 'NYY')
+        {'uid': 1, 'name': 'Babe Ruth', ...}
+    """
+    if isinstance(ident, int):
+      return next((b for b in self.batters if b['uid'] == ident), None)
+    elif callable(ident):
+      return next((b for b in self.batters if ident(b)), None)
+    elif isinstance(ident, str):
+      ident = ident.lower().strip()
+      tokens = ident.split()
+
+      def ordered_prefix_match(b):
+        name_tokens = b['name'].lower().split()
+        if len(tokens) > len(name_tokens):
+          return False
+        return all(name_tokens[i].startswith(tokens[i]) for i in range(len(tokens)))
+
+      def single_token_match(b):
+        name_tokens = b['name'].lower().split()
+        return any(token.startswith(ident) for token in name_tokens)
+
+      if not partial:
+        return next((b for b in self.batters if b['name'].lower() == ident), None)
+
+      if len(tokens) == 1:
+        # Try to match last name exactly or as prefix
+        return next((b for b in self.batters if tokens[0] == b['name'].split()[-1].lower() or single_token_match(b)), None)
+      else:
+        return next((b for b in self.batters if ordered_prefix_match(b)), None)
+    return None
+
+  def _batters(self):
+    sql = ("""
+      SELECT
+        p.uid,
+        p.name,
+        b.team,
+        SUM(b.pa)         AS pa,
+        SUM(b.h)          AS hits,
+        SUM(b.doubles)    AS doubles,
+        SUM(b.triples)    AS triples,
+        SUM(b.hr)         AS hr,
+        SUM(b.bb)         AS bb,
+        SUM(b.hbp)        AS hbp,
+        SUM(b.so)         AS so
+      FROM
+        players p
+      JOIN
+        batting b ON p.uid = b.uid
+      GROUP BY
+        p.uid, p.name
+      HAVING
+        SUM(b.pa) >= 5;
+    """)
+    # Use this query if you want to group them by team.
+    # SELECT p.uid, p.name, b.team, SUM(b.pa) AS pa, SUM(b.h) AS h, SUM(b.doubles) AS doubles, SUM(b.triples) AS triples, SUM(b.hr) AS hr, 
+    # SUM(b.bb) AS bb, SUM(b.hbp) AS hbp, SUM(b.so) AS so FROM players p JOIN batting b ON p.uid = b.uid GROUP BY p.uid, p.name, b.team;
+    rows = self.dbh.execute(sql)
+    return [dict(row) for row in rows] 
+
+class Player:
+  def __init__(self, name, data):
+    self.name   = name
+    self.data   = data
+    self.probs  = self._batting_probabilities(data) # per-PA
+    self.bip    = self._bip_probabilities(data)   # conditional on BIP
+    pa          = data.get("pa", 0) or 0
+    so          = data.get("so", 0) or 0
+    self.k_rate = (so / pa) if pa > 0 else None # still useful for diagnostics
+
+  def name(self):
+    return name
+
+  def _batting_probabilities(self, d):
+    pa  = d["pa"]
+    s1  = d["hits"] - d["doubles"] - d["triples"] - d["hr"]
+    probs = {
+      "out":  (pa - (d["hits"] + d["bb"] + d["hbp"])) / pa,
+      "single": s1 / pa,
+      "double": d["doubles"] / pa,
+      "triple": d["triples"] / pa,
+      "HR":   d["hr"] / pa,
+      "BB":   d["bb"] / pa,
+      "HBP":  d["hbp"] / pa,
+    }
+    s = sum(probs.values())
+    if s > 0:
+      for k in probs: probs[k] /= s
+    return probs
+
+  def _bip_probabilities(self, d):
+    pa  = d.get("pa", 0) or 0
+    bb  = d.get("bb", 0) or 0
+    hbp = d.get("hbp", 0) or 0
+    so  = d.get("so", 0) or 0
+    hr  = d.get("hr", 0) or 0
+    dbl = d.get("doubles", 0) or 0
+    tpl = d.get("triples", 0) or 0
+    hits = d.get("hits", 0) or 0
+    s1  = hits - dbl - tpl - hr
+
+    # BIP events = PA - (BB + HBP + SO)
+    bip_events = max(0, pa - (bb + hbp + so))
+    # in-play outs = BIP - (all hits that are put in play; include HR here since 'X' can be HR)
+    inplay_outs = max(0, bip_events - (s1 + dbl + tpl + hr))
+
+    if bip_events <= 0:
+      # fallback (no BIP sample): reasonable neutral mix
+      return {"out": 0.70, "single": 0.20, "double": 0.07, "triple": 0.01, "HR": 0.02}
+
+    bip = {
+      "out":  inplay_outs / bip_events,
+      "single": s1 / bip_events,
+      "double": dbl / bip_events,
+      "triple": tpl / bip_events,
+      "HR":   hr / bip_events,
+    }
+    # normalize for any rounding drift
+    s = sum(bip.values())
+    for k in bip: bip[k] /= s
+    return bip
+
+  def bprobs(self):
+    return self.probs
+
+  def bip_probs(self):
+    return self.bip
+
+class Column(object):
+  """
+  Reads a column formatted config file which may contain hash (#) comments
+  The parser strips leading and trailing white space along with new line 
+  characters. 
+  """
+  @staticmethod
+  def read(name):
+    """
+    Read a file which contains a column of data. The file may contain
+    hash # comments. Leading and trailing white space will be stripped
+    from the column. 
+
+    Usage example:
+    from awi.config import Column
+
+    col = Column.read('/path/to/file')
+    if len(col) < 1:
+      print("ERROR: Unable to read /path/to/file")
+    else:
+      for word in col:
+        print(word)
+
+    :param name:  String path to the config file
+    :return:      list of lines from the file
+     
+    """ 
+    with open(name, 'r') as f:
+      content = f.readlines()
+
+      lines=[]
+      for line in content:
+        newline  = line.replace('\n','')
+        location = newline.find('#')
+        if location >= 0: # if the line has no comment, location is -1
+          newline = newline[0:location].strip()
+
+        # append if line is not empty
+        if newline != '':
+          lines.append(newline)
+    return lines
+
+  @staticmethod
+  def exists(name):
+    return os.path.exists(name)
+
+class Lineup(object):
+  def __init__(self, roster):
+    if not isinstance(roster, list) and not len(variable) == 9:
+      raise ValueError("Roster must be an array of nine players.")
+    self.index  = 0
+    self.lineup = []
+    self.names  = []
+    self.data   = PlayerData()
+    self.team   = None
+    for p in roster:
+      d = self.data.find(p)
+      if d == None:
+        print("ERROR: No data for {}".format(p))
+        exit(0)
+      self.lineup.append(Player(p, d))
+      self.names.append(p)
+
+  def players(self, bydict=False): 
+    if not bydict:
+      players = []
+      for p in self.lineup:
+        players.append(p.name)
+      return players 
+    else:
+      players = {}
+      for p in self.lineup:
+         players[p.name] = p
+      return players 
+
+  def order(self):
+    return self.lineup
+
+  def names(self):
+    return self.names
+
+  def next(self):
+    tmp = self.lineup[self.index]
+    self.index = self.index+1 if self.index < len(self.lineup)-1 else 0
+    return tmp
+
+  def team(self):
+    return this.team
+
+  def setTeam(self, team):
+    self.team = team
+
+class Simulator(object): 
+  _OUTCOMES  = ("B", "C", "F", "S", "X")
+  _TABLE_RAW = {
+      1:  dict(B=0.4269, C=0.2866, F=0.1007, S=0.0582, X=0.1276),
+      2:  dict(B=0.3978, C=0.1666, F=0.1575, S=0.0904, X=0.1877),
+      3:  dict(B=0.3860, C=0.1285, F=0.1787, S=0.0994, X=0.2073),
+      4:  dict(B=0.3528, C=0.1170, F=0.1979, S=0.1057, X=0.2266),
+      5:  dict(B=0.3129, C=0.0767, F=0.2300, S=0.1120, X=0.2685),
+      6:  dict(B=0.2637, C=0.0440, F=0.2649, S=0.1154, X=0.3119),
+      7:  dict(B=0.2505, C=0.0405, F=0.2765, S=0.1104, X=0.3220),
+      8:  dict(B=0.2350, C=0.0382, F=0.2885, S=0.1062, X=0.3322),
+      9:  dict(B=0.2265, C=0.0360, F=0.2970, S=0.1031, X=0.3374),
+      10: dict(B=0.2108, C=0.0320, F=0.3140, S=0.1033, X=0.3400),
+      11: dict(B=0.2115, C=0.0325, F=0.3142, S=0.1049, X=0.3369),
+      12: dict(B=0.2045, C=0.0356, F=0.3143, S=0.1058, X=0.3398),
+  }
+
+  def __init__(self, num=1000, full=False):
+    self.base_seed  = 0
+    self.world_seed = None
+    self.table      = {n: self._norm_row(r) for n, r in self._TABLE_RAW.items()}
+    self.home       = None
+    self.away       = None
+    self.number     = num
+    self.full       = full
+
+  def setHome(self, home):
+    self.home = home
+
+  def setAway(self, away):
+    self.away = away
+
+  def begin_world(self, world_seed: int):
+    self.world_seed = _h64("world", self.base_seed, world_seed)
+
+  def _rng_env(self):
+    assert self.world_seed is not None, "begin_world(world_seed) must be called first"
+    return np.random.default_rng(_h64(self.world_seed, "env"))
+
+  def _rng_pa(self, inning: int, pa_idx: int, batter_id):
+    assert self.world_seed is not None, "begin_world(world_seed) must be called first"
+    return np.random.default_rng(_h64(self.world_seed, "pa", inning, pa_idx, batter_id))
+
+  def _rng_dp(self, inning: int, pa_idx: int):
+    assert self.world_seed is not None, "begin_world(world_seed) must be called first"
+    return np.random.default_rng(_h64(self.world_seed, "dp", inning, pa_idx))
+
+  def _rng_br(self, inning: int, pa_idx: int):
+    assert self.world_seed is not None, "begin_world(world_seed) must be called first"
+    return np.random.default_rng(_h64(self.world_seed, "br", inning, pa_idx))
+
+  def _norm_row(self, row):
+    s = sum(row.get(k, 0.0) for k in self._OUTCOMES)
+    if s <= 0: raise ValueError("bad row")
+    return {k: row.get(k, 0.0)/s for k in self._OUTCOMES}
+
+  def _row(self, n): # clamp beyond 12
+    return self.table[min(max(1, n), 12)].copy()
+    return self._subrng("br", inning, play_idx)
+
+  def at_bat_with_pitching(self, batter, strike_boost=1.00, ball_boost=1.00, max_pitches=12, target_K=0.225, rng=None):
+    """
+    strike_boost:   >1: more strikes (C/S/F), <1: fewer
+    ball_boost:     >1: more balls,           <1: fewer
+    """
+    balls = strikes = 0
+    for pitch_no in range(1, max_pitches+1):
+      row = self._row(pitch_no)
+      row["B"] *= ball_boost
+      row["C"] *= strike_boost
+      row["S"] *= strike_boost
+      row["F"] *= strike_boost
+      s = sum(row.values())
+      for k in self._OUTCOMES: row[k] /= s
+
+      pick = (rng.choice(self._OUTCOMES, p=[row[o] for o in self._OUTCOMES]) if rng is not None else np.random.choice(self._OUTCOMES, p=[row[o] for o in self._OUTCOMES]))
+
+      if pick == "B":
+        balls += 1
+        if balls == 4:
+          return "BB"  # was "walk"
+      elif pick in ("C", "S"):
+        strikes += 1
+        if strikes == 3:       # <- NESTED here
+          return "out"
+      elif pick == "F":
+        if strikes < 2:
+          strikes += 1
+      else:  # "X"
+        return self._resolve_in_play(batter, target_BABIP=0.295, rng=rng)
+
+    # Fallback: treat as BIP
+    return self._resolve_in_play(batter, target_BABIP=0.295, rng=rng)  # (remove the stray self arg)
+
+  def _resolve_in_play(self, batter, target_BABIP=0.300, rng=None):
+    p = batter.bip_probs().copy()  # strictly {out, single, double, triple, HR}
+
+    hr = p.get("HR", 0.0)
+    non_hr_pool = 1.0 - hr
+    if non_hr_pool <= 1e-12:
+      return "HR"  # degenerate case
+
+    # Current non-HR parts
+    s1 = p.get("single", 0.0)
+    d2 = p.get("double", 0.0)
+    t3 = p.get("triple", 0.0)
+    o  = p.get("out", 0.0)
+    hits_non_hr = s1 + d2 + t3
+    outs_non_hr = o
+
+    # Current BABIP and scale to target
+    cur_babip = hits_non_hr / max(1e-12, hits_non_hr + outs_non_hr)
+    if cur_babip <= 0:
+      scale = 0.0
+    elif cur_babip >= 1.0:
+      scale = 1.0
+    else:
+      scale = target_BABIP / cur_babip
+
+    # Scale hits vs outs within the non-HR pool (keep hit *mix* the same)
+    total_non_hr = hits_non_hr + outs_non_hr
+    if total_non_hr > 0:
+      s1 = (s1 / total_non_hr) * (scale * total_non_hr)
+      d2 = (d2 / total_non_hr) * (scale * total_non_hr)
+      t3 = (t3 / total_non_hr) * (scale * total_non_hr)
+      o  = max(0.0, total_non_hr - (s1 + d2 + t3))
+
+    # Recombine with HR and renormalize
+    probs = {
+      "out": o * non_hr_pool / total_non_hr if total_non_hr > 0 else 0.0,
+      "single": s1 * non_hr_pool / total_non_hr if total_non_hr > 0 else 0.0,
+      "double": d2 * non_hr_pool / total_non_hr if total_non_hr > 0 else 0.0,
+      "triple": t3 * non_hr_pool / total_non_hr if total_non_hr > 0 else 0.0,
+      "HR": hr,
+    }
+    s = sum(probs.values())
+    for k in probs: probs[k] /= s
+
+    keys  = ["out","single","double","triple","HR"]
+    return (rng.choice(keys, p=[probs[k] for k in keys]) if rng is not None else np.random.choice(keys, p=[probs[k] for k in keys]))
+
+  def maybe_double_play(self, bases, outs, dp_rate=0.12, rng=None):
+    """
+    Convert some 'out' events into a 6-4-3 style DP.
+    Triggers only with runner on 1B and <2 outs.
+    Returns (new_bases, new_outs, did_dp).
+    """
+    # Only a DP opportunity with runner on 1B and <2 outs
+    if outs >= 2 or bases[0] is None:
+      return bases, outs, False
+
+    r = (rng.random() if rng is not None else np.random.random())
+    if r < dp_rate:
+      # Batter and runner on 1B are out; others hold
+      new_bases = [None, bases[1], bases[2]]
+      new_outs = min(outs + 2, 3)  # cap at 3 just in case
+      return new_bases, new_outs, True
+
+    return bases, outs, False
+
+  def advance_bases(self, bases, batter, outcome, rng=None):
+    """
+    Advances the runners on base based on the outcome of the at-bat.
+
+    Parameters:
+      bases (list): [first, second, third], each slot holds a runner or None.
+      batter (any): Identifier for the batter (e.g., name, id, object).
+      outcome (str): One of ['out', 'single', 'double', 'triple', 'HR', 'BB', 'HBP'].
+
+    Returns:
+      tuple: (updated_bases, runs_scored)
+    """
+    runs_scored = 0
+    new_bases   = [None, None, None] # 1B, 2B, 3B
+
+    # Advance existing runners
+    for i in reversed(range(3)): # From 3rd base to 1st
+      runner = bases[i]
+      if runner is None:
+        continue
+
+      if outcome == "single":
+        if i == 2:
+          runs_scored += 1 # from 3rd to home
+        elif i == 1:
+          if (rng.random() if rng is not None else np.random.random()) < 0.8:
+            runs_scored += 1
+          else:
+            new_bases[2] = runner # hold at 3rd
+        elif i == 0:
+          if (rng.random() if rng is not None else np.random.random()) < 0.6:
+            new_bases[2] = runner
+          else:
+            new_bases[1] = runner # hold at 2nd
+
+      elif outcome == "double":
+        if i >= 1:
+          runs_scored += 1
+        else:
+          new_bases[2] = runner
+
+      elif outcome == "triple" or outcome == "HR":
+        runs_scored += 1
+
+      elif outcome in ("BB", "HBP"):
+        if i == 2:
+          runs_scored += 1
+        else:
+          new_bases[i+1] = runner
+
+    # Place batter
+    if outcome == "single":
+      new_bases[0] = "batter"
+    elif outcome == "double":
+      new_bases[1] = "batter"
+    elif outcome == "triple":
+      new_bases[2] = "batter"
+    elif outcome == "HR":
+      runs_scored += 1
+    elif outcome in ("BB", "HBP"):
+      if new_bases[0]:
+        if new_bases[1]:
+          if new_bases[2]:
+            runs_scored += 1 # all bases full, runner scores
+          else:
+            new_bases[2] = new_bases[1]
+          new_bases[1] = new_bases[0]
+        else:
+          new_bases[1] = new_bases[0]
+        new_bases[0] = "batter"
+      else:
+        new_bases[0] = "batter"
+
+    return new_bases, runs_scored
+
+
+  def game(self, lineups, series=7, resistance=None, base_seed=101):
+    assert isinstance(lineups, list) and len(lineups) == 2, "lineups must be two teams of nine"
+    sims = 0
+    away = 0
+    home = 0
+    ties = 0
+    if series % 2 == 0:
+      need = (series / 2) +1
+    else:
+      need = series // 2 + 1 # e.g., best-of-7 -> 4
+    series_idx = 0
+
+    def verbify(team: str) -> str:
+      return "wins" if team.strip().lower().endswith(("s", "x")) else "win"
+
+    while sims < self.number:
+      wins = [0, 0] # [away, home]
+    
+      for g in range(1, series + 1):
+        if sims >= self.number:
+          break
+
+        # stable world seed per game (prefer your existing h64 helper)
+        seed = h64("series", series_idx, "game", g, base_seed)
+        self.begin_world(seed)
+
+        score = self._game(lineups, resistance)
+        print(f"Game {g}: {score[0]} - {score[1]}")
+
+        if score[0] > score[1]:
+          wins[0] += 1      # away won
+        elif score[1] > score[0]:
+          wins[1] += 1      # home won
+        else:
+          continue
+
+        if self.full:
+          if wins[0] + wins[1] == series:
+            if wins[0] > wins[1]:
+              away += 1
+              print(f"Away: {lineups[0].team} {verbify(lineups[0].team)}  {wins[0]} - {wins[1]}")
+            if wins[1] > wins[0]:
+              home += 1
+              print(f"Home: {lineups[1].team} {verbify(lineups[1].team)} {wins[0]} - {wins[1]}")
+            if wins[0] == wins[1] and wins[0] >= series / 2:
+              home += .5
+              away += .5
+              ties +=  1
+              print(f"{lineups[1].team} tied {lineups[0].team} {wins[0]}-{wins[0]}")
+            sims += 1
+            break
+        else:
+          if wins[0] == need:
+            away += 1
+            sims += 1
+            print(f"Away: {lineups[0].team} {verbify(lineups[0].team)} {wins[0]} - {wins[1]}")
+            break
+          if wins[1] == need:
+            home += 1
+            sims += 1
+            print(f"Home: {lineups[1].team} {verbify(lineups[1].team)} {wins[0]} - {wins[1]}")
+            break
+          if wins[0] == wins[1] and wins[0] >= series / 2:
+            home += .5
+            away += .5
+            sims +=  1
+            ties +=  1
+            print(f"{lineups[1].team} tied {lineups[0].team} {wins[0]}-{wins[0]}")
+            break
+
+      series_idx += 1
+
+    total = home + away
+    if total:
+      if ties > 0:
+        txt = f", Ties: {ties} ({ties/total:.3f})"
+      else:
+        txt = ""
+      print(f"Totals: {lineups[0].team}: {away} ({away/total:.3f}), "
+         f"{lineups[1].team}: {home} ({home/total:.3f}) {txt}")
+    else:
+      print("Totals: No completed series.")
+
+
+  def _game(self, lineups, resistance=None, rng=None):
+    assert self.world_seed is not None, "call begin_world(world_seed) before run()"
+    score = [0, 0] # [away, home]
+    pix = 0        # plate-appearance index for deterministic substreams
+  
+    # 9 innings, then extras until someone leads
+    inning = 1
+    while True:
+      for i in (0, 1):         # 0 = away, 1 = home
+        outs = 0
+        bases = [None, None, None]  # reset every half-inning
+        while outs < 3:
+          batter = lineups[i].next()
+          pa_rng = self._rng_pa(inning, pix, getattr(batter, 'name', str(batter)))
+          if resistance:
+            outcome = self.at_bat_with_pitching(batter, rng=pa_rng, **resistance)
+          else:
+            tmp = batter.bprobs()
+            outcome = pa_rng.choice(list(tmp.keys()), p=list(tmp.values()))
+          if outcome == "out":
+            bases, outs, did_dp = self.maybe_double_play(bases, outs, dp_rate=0.12, rng=pa_rng)
+            if not did_dp:
+              outs += 1
+          else:
+            bases, runs = self.advance_bases(bases, getattr(batter, 'name', str(batter)), outcome, rng=pa_rng)
+            score[i] += runs   # <-- credit the *batting* team
+          pix += 1
+  
+      if inning >= 9 and score[0] != score[1]:
+        break
+      inning += 1
+
+    return score
+
+  def run(self, lineup, resistance=None, rng=None):
+    assert self.world_seed is not None, "call begin_world(world_seed) before run()"
+    order = itertools.cycle(lineup)
+    bases = [None, None, None]
+    score = 0
+    pa_idx = 0
+    for inning in range(1, 10):
+      outs = 0
+      while outs < 3:
+        batter = next(order)
+        pa_rng = self._rng_pa(inning, pa_idx, getattr(batter, 'name', str(batter)))
+        if resistance:
+          outcome = self.at_bat_with_pitching(batter, rng=pa_rng, **resistance)
+        else:
+          tmp = batter.bprobs()
+          outcome = pa_rng.choice(list(tmp.keys()), p=list(tmp.values()))
+        if outcome == "out":
+          bases, outs, did_dp = self.maybe_double_play(bases, outs, dp_rate=0.12, rng=pa_rng)
+          if not did_dp:
+            outs += 1
+        else:
+          bases, runs = self.advance_bases(bases, getattr(batter, 'name', str(batter)), outcome, rng=pa_rng)
+          score += runs
+        pa_idx += 1
+    return score
+
+  def _run_game(self, lineup, env, game_idx, base_seed):
+    """Set per-game world seed and run once using world/substreams."""
+    seed = (hash((base_seed, game_idx)) & 0xFFFFFFFF)
+    self.begin_world(seed)
+    try:
+      return self.run(lineup, env)
+    except TypeError:
+      try:
+        return self.run(lineup)
+      except TypeError:
+        return self(lineup)
+
+  def _avg_score(self, order_names, players_by_name, env, seed_seq_list, n_sims):
+    lineup_objs = [players_by_name[n] for n in order_names]
+    total = 0.0
+    for i in range(n_sims):
+      self.begin_world(seed_seq_list[i])
+      try:
+        total += self.run(lineup_objs, env)
+      except TypeError:
+        total += self.run(lineup_objs)
+    return total / n_sims
+
+  def _seed_schedule(self, max_games, base_seed=42):
+    """Deterministic per-game SeedSequences reused by ALL lineups & stages."""
+    ss = np.random.SeedSequence(base_seed)
+    return ss.spawn(max_games) 
+
+  def _random_unique_perms(self, items, count, seed=7):
+    """Draw `count` unique random permutations without building all 9! at once."""
+    rnd = random.Random(seed)
+    items = list(items)
+    seen = set()
+    while len(seen) < count:
+      rnd.shuffle(items)
+      t = tuple(items)
+      if t not in seen:
+        seen.add(t)
+        yield t
+
+  def successive_halving(self, lineup, env, stages=None, base_seed=42, sample_seed=123):
+    """
+    Returns (best_avg, best_lineup_names). Stages = (num_lineups, sims_each).
+    Uses Common Random Numbers (CRN): game i uses the same RNG stream for every lineup,
+    and later stages reuse the first seeds (only add more games).
+    """
+    if stages is None:
+      stages = [
+        (4000,    40),
+        (1000,   100),
+        ( 250,   300),
+        (  50,   800),
+        (  10,  2000),
+        (   1, 10000),
+      ]
+
+    names   = lineup.players()              # list[str]
+    players = lineup.players(bydict=True)   # dict[str -> Player]
+
+    # Stage 0: deterministic candidate set using your sampler
+    candidates = list(self._random_unique_perms(names, stages[0][0], seed=sample_seed))
+
+    # Precompute per-game seeds up to max sims (nested across stages)
+    max_sims = max(s for _, s in stages)
+    seed_seq_list = self._seed_schedule(max_sims, base_seed=base_seed)
+
+    # Staged evaluation
+    for si, (n_lineups, n_sims) in enumerate(stages):
+      t0 = time.time()
+      if len(candidates) > n_lineups:
+        candidates = candidates[:n_lineups]
+
+      scores = []
+      for order in candidates:
+        avg = self._avg_score(order, players, env, seed_seq_list, n_sims)
+        scores.append((avg, order))
+
+      scores.sort(reverse=True, key=lambda x: x[0])
+      keep = stages[si+1][0] if si + 1 < len(stages) else 1
+      candidates = [order for _, order in scores[:keep]]
+
+      best_avg, best_order = scores[0]
+      print(f"[SH {si}] {len(scores)} lineups  {n_sims} sims "
+            f"best {best_avg:.3f}  next_keep={keep}  time={time.time()-t0:.1f}s")
+
+    return best_avg, best_order
+
+# ---------- optional: exhaustive (slow) ----------
+
+def brute_force_best(sim_fn, roster_names, players_by_name, env, sims_each=250, top_k=5, base_seed=99):
+  """Scan all 9! orders (slow). Returns a list of (avg, names), best→worst."""
+  heap = [] # min-heap
+  t0 = time.time()
+  for idx, names in enumerate(itertools.permutations(roster_names, 9), 1):
+    avg = _avg_score(sim_fn, names, players_by_name, env, sims_each, base_seed)
+    if len(heap) < top_k:
+      heapq.heappush(heap, (avg, names))
+    elif avg > heap[0][0]:
+      heapq.heapreplace(heap, (avg, names))
+    if idx % 2000 == 0:
+      print(f"[{idx}] best_so_far={max(heap)[0]:.3f} elapsed={time.time()-t0:.1f}s")
+  heap.sort(reverse=True)
+  return heap
+
+def isNested(thing):
+  if not isinstance(thing, list):
+    return False
+
+  for item in thing:
+    if isinstance(item, list):
+      return True
+  return False
+
+def teamName(col):
+  team = None
+  pat  = re.compile(r'^\s*(team|name)\s*:\s*(.*)\s*$', re.IGNORECASE)
+
+  to_pop = []
+  for i, line in enumerate(col):
+    s = str(line)
+    m = pat.match(s)
+    if m:
+      key = m.group(1).lower()
+      val = m.group(2).strip()
+      if key == "team" and team is None:
+        team = val
+      elif key == "name" and team is None:
+        name = val
+      to_pop.append(i)
+
+  for i in reversed(to_pop):
+    col.pop(i)
+
+  return team
+
+def normalize_teams(args):
+  teams = []
+  for item in args.teams:
+    for t in item.split(","):
+      t = t.strip()
+      if t:
+        teams.append(t)
+  return teams
+	 
+def main(args: argparse.Namespace):
+  home    = None
+  away    = None
+  teams   = normalize_teams(args)
+  rosters = []
+  if len(teams) == 0:
+    tm1  = Column.read(teams[0])
+    if isinstance(tm1, list):
+      team = teamName(tm1)
+      home = Lineup(tm1)
+      if team == None:
+        home.setTeam("Home")
+      else:
+        home.setTeam(team)
+  else: 
+    if teams[0] is not None:
+      tm1 = Column.read(teams[0])
+      if isinstance(tm1, list):
+        team = teamName(tm1)
+        home = Lineup(tm1)
+        if team == None: 
+          home.setTeam("Home")
+        else:
+          home.setTeam(team)
+    if teams[1] is not None:
+      tm2  = Column.read(teams[1])
+      if isinstance(tm2, list):
+        team = teamName(tm2)
+        away = Lineup(tm2)
+        if team == None:
+          away.setTeam("Away")
+        else:
+          away.setTeam(team)
+
+  simulate = Simulator(args.num, args.full)
+  env      = {'strike_boost': 1.08, 'ball_boost': 0.92}
+
+  if home is not None and away is not None:
+    rosters.append(away)
+    rosters.append(home)
+
+  if args.best:
+    if len(teams) == 2:
+      for i in range(len(rosters)):
+        best_avg, best_names = simulate.successive_halving(rosters[i], env)
+        print("\nBest lineup:", best_names, f"avg={best_avg:.3f}")
+    else:
+      best_avg, best_names = simulate.successive_halving(home, env)
+      print("\nBest lineup:", best_names, f"avg={best_avg:.3f}")
+
+  if args.game:
+    if len(rosters) != 2:
+      print("ERROR: A game requires two teams")
+    simulate.game(rosters, args.series, env)
+     
+  #ttl = 0
+  #for g in range(num):
+  #  ttl = simulate.run(lineup, env)
+  #  ttl += s
+  # 
+  #print("Average score: {}".format(ttl/num))
+
+if __name__ == '__main__':
+  parser = argparse.ArgumentParser(
+    prog            = os.path.basename(__file__),
+    description     = 'Simulate games and runs output',
+    formatter_class = lambda prog: argparse.RawTextHelpFormatter(prog,max_help_position=72)
+  )
+  parser.add_argument(
+    '-t',
+    '--teams',
+    dest     = 'teams',
+    metavar  = 'teams',
+    default  = None,
+    required = True,
+    action   = "append",
+    help     = dedent("""\
+        Text file(s) with a lineup in column format.
+        Separate two files with a comma: -t pirates.txt,yankees.txt
+        Or use it twice: -t pirates.txt -t yankees.txt
+    """)
+  )   
+  parser.add_argument(
+    '-n',
+    '--num',
+    type     = int,
+    dest     = 'num',
+    metavar  = 'num',
+    default  = 5000,
+    required = False,
+    help     = dedent("""\
+      Select the number of simulations.  
+    """)
+  )   
+  parser.add_argument(
+    '-b',
+    '--best',
+    default  = False,
+    required = False,
+    action   = 'store_true',
+    help     = dedent("""\
+      Run simulations on every combination of the lineup and select the best.
+    """)
+  )
+  parser.add_argument(
+    '-g',
+    '--game',
+    default  = False,
+    required = False,
+    action   = 'store_true',
+    help     = dedent("""\
+      Simulate a game against two lineups. Use -t/--team to set two lineups separated by a comma
+      Example: -g -t pirates,txt,yankees.txt 
+    """)
+  )
+  parser.add_argument(
+    '-s',
+    '--series',
+    type     = int,
+    default  = 1,
+    required = False,
+    metavar  = 'num',
+    help     = dedent("""\
+      Series length. For simulations between two teams, use this option to set the number of games 
+      in a series. (Default 1). 
+    """)
+  )
+  parser.add_argument(
+    '-f',
+    '--full',
+    default  = False,
+    required = False,
+    action   = 'store_true',
+    help     = dedent("""\
+      Full series - emulate a regular season series in which all N games are played. (Default: best of N)
+    """)
+  )
+
+  args  = parser.parse_args()
+
+  try:
+    main(args)
+  except KeyboardInterrupt:
+    print(" Quitting...")
+  try:
+    sys.exit(0)
+  except SystemExit:
+    os._exit(0)  
+ 
+

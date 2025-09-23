@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+
+# If the harvestor leaves too many chromes behind, go nuclear on it...
+import subprocess
+
+subprocess.call(["pkill", "-f", "chrome"])
+subprocess.call(["pkill", "-f", "Google Chrome.app"])
+

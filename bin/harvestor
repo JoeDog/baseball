@@ -1,0 +1,977 @@
+#!/opt/homebrew/bin/python3
+import os
+import re
+import csv
+import sys
+import time
+import argparse
+import requests
+import random
+import datetime
+import traceback
+import psutil
+import shutil
+import signal
+import sqlite3
+import urllib3
+import tempfile
+import atexit
+import weakref
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import TimeoutException
+
+class TimeoutExceptionHard(Exception): pass
+
+def _timeout_handler(signum, frame):
+  raise TimeoutExceptionHard("Timed out at OS level")
+
+signal.signal(signal.SIGALRM, _timeout_handler)
+urllib3.disable_warnings()
+
+class Spider(object):
+  USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.110 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_2_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.5615.137 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Firefox/102.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:111.0) Gecko/20100101 Firefox/111.0",
+  ]
+
+  def __init__(self):
+    self.pid = None
+    self.tmp = tempfile.mkdtemp()
+    self.dvr = self._initDriver()
+    self.dbf = os.path.dirname(os.path.realpath(__file__))+"/../data/baseball.db"
+    self.dbh = self._initDB()
+    self._create_additional_tables()
+
+    if hasattr(self.dvr, "service") and hasattr(self.dvr.service, "process"):
+      try:
+        self.pid = self.dvr.service.process.pid
+        parent = psutil.Process(self.pid)
+        self._child_pids = [p.pid for p in parent.children(recursive=True)]
+      except Exception as e:
+        print(f"Could not get Chromedriver children: {e}")
+    atexit.register(weakref.proxy(self)._cleanUpDriver)
+
+  def __del__(self):
+    print("Object is being destroyed.")
+    self._cleanUpDriver()
+    try:
+      self.dbh.close()
+    except Exception:
+      pass
+
+  def get(self, url, retries=3):
+    for attempt in range(retries):
+      if not self._isDriverAlive():
+        print("Driver is dead ... exiting.")
+        self._cleanUpDriver()
+        sys.exit(1)
+
+      try:
+        print(f"Loading URL (attempt {attempt+1}): {url}")
+        signal.alarm(30)  # hard kill after 30s
+        self.dvr.get(url)
+        signal.alarm(0)
+        return True
+      except TimeoutException:
+        print(f"Selenium timeout on {url} - recovering driver")
+        self._recoverDriver()
+      except TimeoutExceptionHard:
+        print(f"Hard timeout on {url} - killing driver")
+        self._recoverDriver()
+      except Exception as e:
+        print(f"Unexpected error on {url}: {e}")
+        self._recoverDriver()
+      finally:
+        signal.alarm(0)
+
+    return False
+
+  def wait(self, attr, selector, seconds=20):
+    """
+    Wait for presence of at least one matching element.
+
+    Parameters
+    ----------
+    attr     : By               One of selenium.webdriver.common.by.By (e.g., By.CSS_SELECTOR).
+    selector : str | list[str]  A single selector using `attr` OR across all selectors using the same `attr`
+    seconds : int               Timeout in seconds.
+
+    Returns
+    -------
+    bool              True if found before timeout, else False.
+    """
+    try:
+      # Single selector
+      if isinstance(selector, str):
+        sel = selector.strip()
+        if not sel:
+          raise ValueError("selector string is empty")
+        WebDriverWait(self.dvr, seconds).until(
+          EC.presence_of_element_located((attr, sel))
+        )
+        return True
+
+      # List of selectors (OR)
+      if isinstance(selector, list):
+        sels = [s.strip() for s in selector if isinstance(s, str) and s.strip()]
+        if not sels:
+          raise ValueError("selector list is empty or contains no valid strings")
+
+        WebDriverWait(self.dvr, seconds).until(
+          lambda d: any(d.find_elements(attr, s) for s in sels)
+        )
+        return True
+      raise TypeError("selector must be a str or list[str]")
+
+    except TimeoutException:
+      return False
+
+  def waitForDom(self, seconds=10):
+    try: 
+      WebDriverWait(self.dvr, seconds).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+      )
+    except TimeoutException:
+      return False
+    return True
+
+  def find(self, attr, selector, element=None):
+    """
+    Return a WebElement on a page based on its attribute and its name
+
+    Params:
+    attr (By)       By.ID, By.CSS_SELECTOR, By.TAG_NAME, etc. see: pydoc3 selenium.webdriver.common.by.By
+    selector (str)  HTML5 descriptor
+    
+    Returns:
+    selenium.webdriver.remote.webelement.WebElement
+    """
+    try:
+      if element:
+        return element.find_element(attr, selector)
+      return self.dvr.find_element(attr, selector)
+    except Exception as e:
+      return None
+
+  def findList(self, attr, selector, element=None, timeout=10):
+    """
+    Return a list of WebElements on a page based on its attribute and its name
+
+    Params:
+    attr (By)       By.ID, By.CSS_SELECTOR, By.TAG_NAME, etc. see: pydoc3 selenium.webdriver.common.by.By
+    selector (str)  HTML5 descriptor
+    
+    Returns:
+    selenium.webdriver.remote.webelement.WebElement
+    """
+    try:
+      if element:
+        WebDriverWait(self.dvr, timeout).until(lambda d: element.find_elements(attr, selector))
+        return element.find_elements(attr, selector)
+      else:
+        WebDriverWait(self.dvr, timeout).until(EC.presence_of_all_elements_located((attr, selector)))
+        return self.dvr.find_elements(attr, selector)
+    except Exception as e:
+      return []
+
+  def _initDriver(self):
+    print("Initializing WebDriver...")
+    self.tmp = tempfile.mkdtemp()
+
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument(f"--user-data-dir={self.tmp}")
+    options.add_argument("--disable-extensions") 
+    options.add_argument("--disable-background-networking") ####
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--disable-sync")
+    options.add_argument("--disable-translate")
+    options.add_argument("--metrics-recording-only")
+    options.add_argument("--safebrowsing-disable-auto-update")
+    options.add_argument("--disable-component-update")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-client-side-phishing-detection")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--no-first-run")
+    options.add_argument("--mute-audio")                    ####
+    options.add_experimental_option("detach", False)
+
+    self.dvr = webdriver.Chrome(options=options)
+    self.dvr.set_page_load_timeout(15)
+    self.dvr.set_script_timeout(15)
+
+    self.pid = self.dvr.service.process.pid
+
+    try:
+      parent = psutil.Process(self.pid)
+      children = parent.children(recursive=True)
+      self._child_pids = [child.pid for child in children]
+    except Exception:
+      self._child_pids = []
+
+    return self.dvr
+
+  def _isDriverAlive(self):
+    try:
+      return psutil.Process(self.pid).is_running()
+    except Exception:
+      return False
+    return True
+
+  def _cleanUpDriver(self):
+    print("Cleaning up WebDriver...")
+
+    # Gracefully quit driver if possible
+    try:
+      if hasattr(self, "dvr") and self.dvr:
+        print("Calling driver.quit()")
+        self.dvr.quit()
+      if hasattr(self, "dvr") and self.dvr.service:
+        print("Calling driver.service.stop()")
+        self.dvr.service.stop()
+    except Exception as e:
+      print(f"Error shutting down driver: {e}")
+
+    # Kill known PIDs if tracked
+    pids_to_kill = set()
+
+    if hasattr(self, "pid"):
+      pids_to_kill.add(self.pid)
+    if hasattr(self, "_child_pids"):
+      pids_to_kill.update(self._child_pids)
+    if hasattr(self, "chromedriver_pid"):
+      pids_to_kill.add(self.chromedriver_pid)
+
+    # Sweep for rogue processes: chromedriver, crashpad, chrome helpers
+    for proc in psutil.process_iter(attrs=["pid", "name", "cmdline"]):
+      try:
+        name = proc.info["name"].lower()
+        cmdline_parts = proc.info.get("cmdline")
+        cmdline = " ".join(cmdline_parts).lower() if isinstance(cmdline_parts, list) else ""
+
+        if any(term in name for term in ["chromedriver", "crashpad", "chrome"]):
+          if "selenium" in cmdline or "chrome_mac" in cmdline or "--port=" in cmdline:
+            print(f"Forcibly killing rogue Chrome PID {proc.pid}")
+            pids_to_kill.add(proc.pid)
+      except (psutil.NoSuchProcess, psutil.AccessDenied):
+        continue
+
+    # Kill collected PIDs
+    for pid in pids_to_kill:
+      try:
+        proc = psutil.Process(pid)
+        print(f"Killing PID {pid} ({proc.name()})")
+        proc.kill()
+      except psutil.NoSuchProcess:
+        pass
+      except Exception as e:
+        print(f"Error killing PID {pid}: {e}")
+
+    # Clean up temporary Chrome profile if defined
+    if hasattr(self, "tmp"):
+      try:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        print(f"Deleted temp profile at {self.tmp}")
+      except Exception as e:
+        print(f"Error deleting temp profile: {e}")
+
+  def _recoverDriver(self):
+    self._cleanUpDriver()
+    self.dvr = self._initDriver()
+
+  def _initDB(self):
+    conn = sqlite3.connect(self.dbf) # Use ":memory:" for in-RAM DB
+    conn.execute("""
+      CREATE TABLE IF NOT EXISTS "reference" (
+        uid        INTEGER PRIMARY KEY,
+        lookup     VARCHAR(50),
+        url        VARCHAR(500),
+        state      INTEGER DEFAULT 0,
+        columns    TEXT,
+        attempts   INTEGER DEFAULT 0,
+        discovered TIMESTAMP,
+        inserted   TIMESTAMP,
+        parsed     TIMESTAMP,
+        success    TIMESTAMP,
+        failed     TIMESTAMP
+      );
+    """)
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reference_url_unique ON reference(url)")
+    return conn 
+
+
+  def nextRecord(self):
+    now = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+    sql = '''
+      WITH next AS (
+        SELECT uid FROM reference
+        WHERE state = 0
+        ORDER BY inserted ASC
+        LIMIT 1
+      )
+      UPDATE reference
+      SET state = 1, parsed = ?
+      WHERE uid IN (SELECT uid FROM next)
+      RETURNING uid, url, attempts
+    '''
+    csr = self.dbh.execute(sql, (now,))
+    row = csr.fetchone()
+    return dict(zip(['uid', 'url', 'attempts'], row)) if row else None
+
+  def isNew(self, url):
+    rows = self.dbh.execute("SELECT uid FROM reference WHERE url='{}'".format(url)).fetchall()
+    for (uid,) in rows:
+      if uid > 0: 
+        return False
+    return True
+
+  def addUrl(self, url):
+    self.dbh.execute(
+      "INSERT OR IGNORE INTO reference (url, state, discovered) VALUES (?, ?, ?)",
+      (url, 0, datetime.datetime.now().isoformat(sep=' '))
+    )
+    self.dbh.commit()
+    return True
+
+  def handleUrl(self, url:str):
+    self.addUrl(url)
+    uid = None
+    sql = "SELECT uid FROM reference WHERE url='{}'".format(url)
+    csr = self.dbh.execute(sql)
+    res = csr.fetchone()
+    if len(res) == 0:
+      return -1
+    else:
+      uid = res[0]
+      return uid 
+
+"""
+Summarize a player's career stats
+SELECT A.name, B.uid, SUM(B.g) AS games, SUM(B.pa) AS plate_appearances, SUM(B.ab) AS at_bats, SUM(B.r) AS runs, SUM(B.h)  AS hits, SUM(B.doubles) AS doubles, SUM(B.triples) AS triples, SUM(B.hr) AS home_runs, SUM(B.rbi) AS rbi, SUM(B.sb) AS stolen_bases, SUM(B.bb) AS walks, SUM(B.so) AS strikeouts, ROUND(SUM(B.h) * 1.0 / SUM(B.ab), 3) AS batting_avg, ROUND(SUM(B.war), 1) AS career_war FROM players A JOIN batting B ON A.uid=B.uid WHERE A.uid = 11;
+
+Summarize a player's career by season.
+SELECT A.name, B.uid, B.season, B.team, SUM(B.g) AS games, SUM(B.pa) AS plate_appearances, SUM(B.ab) AS at_bats, SUM(B.r) AS runs, SUM(B.h) AS hits, SUM(B.doubles) AS doubles, SUM(B.triples) AS triples, SUM(B.hr) AS home_runs, SUM(B.rbi) AS rbi, SUM(B.sb) AS stolen_bases, SUM(B.bb) rs A JOIN batting B ON A.uid = B.uid WHERE A.uid = 1102 GROUP BY A.name, B.uid, B.season ORDER BY B.season;
+
+Summarize a player's career by season with totals
+SELECT A.name, B.season, B.team, SUM(B.g) AS games, SUM(B.pa) AS plate_appearances, SUM(B.ab) AS at_bats, SUM(B.r) AS runs, SUM(B.h) AS hits, SUM(B.doubles) AS doubles, SUM(B.triples) AS triples, SUM(B.hr) AS home_runs, SUM(B.rbi) AS rbi, SUM(B.sb) AS stolen_bases, SUM(B.bb) AS walks, SUM(B.so) AS strikeouts, ROUND(SUM(B.h) * 1.0 / NULLIF(SUM(B.ab), 0), 3) AS batting_avg, ROUND(SUM(B.war), 1) AS war FROM players A JOIN batting B ON A.uid = B.uid WHERE A.uid = 1102 GROUP BY A.name, B.uid, B.season, B.team UNION ALL SELECT "Total", NULL AS season, NULL AS team, SUM(B.g), SUM(B.pa), SUM(B.ab), SUM(B.r), SUM(B.h), SUM(B.doubles), SUM(B.triples), SUM(B.hr), SUM(B.rbi), SUM(B.sb), SUM(B.bb), SUM(B.so), ROUND(SUM(B.h) * 1.0 / NULLIF(SUM(B.ab), 0), 3), ROUND(SUM(B.war), 1) FROM players A JOIN batting B ON A.uid = B.uid WHERE A.uid = 1102 GROUP BY A.name, B.uid;
+
+Summarize all players' career stats
+SELECT A.name, B.uid, SUM(B.g) AS games, SUM(B.pa) AS plate_appearances, SUM(B.ab) AS at_bats, SUM(B.r) AS runs, SUM(B.h) AS hits, SUM(B.doubles) AS doubles, SUM(B.triples) AS triples, SUM(B.hr) AS home_runs, SUM(B.rbi) AS rbi, SUM(B.sb) AS stolen_bases, SUM(B.bb) AS walks, SUM(B.so) AS strikeouts, ROUND(SUM(B.h) * 1.0 / NULLIF(SUM(B.ab), 0), 3) AS batting_avg, ROUND(SUM(B.war), 1) AS career_war FROM players A JOIN batting B ON A.uid = B.uid GROUP BY B.uid
+
+SELECT A.name, SUM(B.g) AS games, SUM(B.hr) AS home_runs, ROUND(SUM(B.hr) * 1.0 / NULLIF(SUM(B.g), 0), 3) AS hr_average FROM players A JOIN batting B ON A.uid = B.uid GROUP BY A.uid;
+Or to filter noise:
+SELECT A.name, SUM(B.g) AS games, SUM(B.hr) AS home_runs, ROUND(SUM(B.hr) * 1.0 / NULLIF(SUM(B.g), 0), 3) AS hr_average FROM players A JOIN batting B ON A.uid = B.uid GROUP BY A.uid HAVING SUM(B.g) >= 500 ORDER BY hr_average DESC;
+Or with numbered rows and teams:
+WITH player_totals AS (SELECT A.uid, A.name, SUM(B.g) AS games, SUM(B.hr) AS home_runs, SUM(B.hr) * 1.0 / NULLIF(SUM(B.g), 0) AS raw_hr_average, ROUND(SUM(B.hr) * 1.0 / NULLIF(SUM(B.g), 0), 3) AS hr_average FROM players A JOIN batting B ON A.uid = B.uid GROUP BY A.uid, A.name HAVING SUM(B.g) >= 500), team_totals AS ( SELECT B.uid, B.team, SUM(B.g) AS team_games, ROW_NUMBER() OVER (PARTITION BY B.uid ORDER BY SUM(B.g) DESC) AS rn FROM batting B GROUP BY B.uid, B.team), primary_teams AS ( SELECT uid, team FROM team_totals WHERE rn = 1) SELECT ROW_NUMBER() OVER (ORDER BY pt.raw_hr_average DESC) AS Rank, pt.name AS Name, pt.games AS Games, pt.home_runs AS HR, pt.hr_average AS "HR Average", ptm.team AS Team FROM player_totals pt JOIN primary_teams ptm ON pt.uid = ptm.uid ORDER BY pt.raw_hr_average DESC LIMIT 15;
+"""
+
+class Baseball(Spider):
+  def __init__(self, args: argparse.Namespace):
+    super().__init__()
+    self.args = args
+    if self.args.url:
+      uid = self.handleUrl(self.args.url)
+      if uid > 0:
+        row = [uid, self.args.url, 0]
+        rec = dict(zip(['uid', 'url', 'attempts'], row)) 
+        self.process(rec)
+      exit(0)
+ 
+    if self.args.locate:
+      self.locate()
+      exit(0)
+
+    rec = self.nextRecord()
+    itr = 0
+    while rec:
+      self.process(rec)
+      rec = self.nextRecord()
+      time.sleep(random.uniform(8, 22))
+      itr += 1
+      if itr == 5000:
+        print("Added {}".format(itr))
+        break
+
+  def locate(self):
+    try:
+      super().get("https://www.baseball-reference.com/players/")
+      super().wait(By.CSS_SELECTOR, "div.section_content")
+
+      letter_links = []
+      for a in self.findList(By.CSS_SELECTOR, "div.section_content > ul > li > a"):
+        href = a.get_attribute("href")
+        if href:
+          letter_links.append(href)
+
+      for letter_url in letter_links:
+        time.sleep(random.uniform(2, 6))
+        super().get(letter_url)
+        super().wait(By.CSS_SELECTOR, "div.section_content#div_players_")
+
+        player_links = []
+        # BROAD selector: handles <p><a> and <p><b><a> and similar
+        for p in self.findList(By.CSS_SELECTOR, "div.section_content#div_players_ p a"):
+          href = p.get_attribute("href")
+          if href:
+            super().addUrl(href)
+    except TimeoutException:
+      print("Unable to find data on page.")
+
+  def process(self, rec):
+    # Modular Data Extraction pattern
+    def extract_table(table_id):
+      try:
+        self.wait(By.CSS_SELECTOR, f"div.table_container.tabbed.current#div_{table_id}")
+        table = self.find(By.ID, table_id)
+        thead = table.find_element(By.TAG_NAME, "thead")
+        headers = [th.text for th in thead.find_elements(By.TAG_NAME, "th")]
+        rows = table.find_element(By.TAG_NAME, "tbody").find_elements(By.TAG_NAME, "tr")
+
+        records = []
+        for row in rows:
+          if "thead" in row.get_attribute("class"):
+            continue
+          cells = row.find_elements(By.XPATH, "./th | ./td")
+          values = [cell.text for cell in cells]
+          records.append(dict(zip(headers, values)))
+        return records
+      except Exception as e:
+        return []
+
+    # Load the page
+    super().get(rec["url"])
+    time.sleep(random.uniform(2, 7))  # be polite
+
+    # Get player info (only once)
+    info = self.info()
+    print(info)
+    if not info:
+      print(f"[ERROR] No player info found at {rec['url']}")
+      return
+
+    self.playerInsert(rec["uid"], info)
+
+    okay = False
+    # Pitching
+    pitching_records = extract_table("players_standard_pitching")
+    for row in pitching_records:
+      row["uid"] = rec["uid"]
+      okay = self.pitchingInsert(row)
+
+    # Batting
+    batting_records = extract_table("players_standard_batting")
+    for row in batting_records:
+      row["uid"] = rec["uid"]
+      okay = self.battingInsert(row)
+
+    # Mark reference as parsed
+    sql = "UPDATE reference SET state = 1 WHERE uid=?"
+    self.dbh.execute(sql, (rec["uid"],))
+    self.dbh.commit()
+
+    if okay:
+      self.dbh.execute("UPDATE reference SET inserted = ? WHERE uid = ?",(datetime.datetime.now().isoformat(sep=' '), rec["uid"]))
+      self.dbh.commit()
+
+  def skip(self, uid):
+    sql = "UPDATE reference SET state = 2 WHERE uid={}".format(uid)
+    self.dbh.execute(sql)
+    self.dbh.commit()
+    return 
+
+  def info(self):
+    info = {}
+    sels = [
+      "#meta h1 span",        # standard layout
+      "div.nothumb h1 span",  # nothumb layout
+      "h1 span",              # final fallback
+    ]
+
+    self.waitForDom(seconds=15)
+
+    ok = self.wait(By.CSS_SELECTOR, sels, seconds=15)  # was timeout=10
+    if not ok:
+      with open("page_dump.html", "w", encoding="utf-8") as f:
+        f.write(self.dvr.page_source)
+      print("Name header not found; dumped page_source to page_dump.html")
+      return None
+
+    elem = None
+    for sel in sels:
+      els = self.findList(By.CSS_SELECTOR, sel) or []
+      if els:
+        elem = els[0]
+        break
+
+    if elem is None:
+      print("Element not found. Skipping.")
+      return None
+
+    name = (elem.get_attribute("textContent") or elem.get_attribute("innerText") or elem.text or "").strip()
+    info["name"] = name
+    
+    # --- Photo URLs ---
+    #img_tags = self.find_elements(By.CSS_SELECTOR, ".media-item img")
+    #info['photos'] = [img.get_attribute("src") for img in img_tags]
+
+    # --- Positions ---
+    elem = self.find(By.XPATH, "//p[strong[starts-with(text(), 'Position')]]")
+    if elem is not None:
+      positions_text = elem.text
+      info['positions'] = positions_text.split(":")[-1].strip()
+    else:
+      info['positions'] = "Unknown"
+
+    # --- Bats / Throws ---
+    elem = self.find(By.XPATH, "//p[strong[text()='Bats: ']]")
+    if elem is not None:
+      bt_text = elem.text
+      bats_throws    = [part.strip() for part in bt_text.split("\u2022")]
+      info['bats']   = bats_throws[0].replace("Bats: ", "")
+      info['throws'] = bats_throws[1].replace("Throws: ", "")
+    else:
+      info['bats']   = None
+      info['throws'] = None
+
+    # --- Height / Weight ---
+    info["height"] = None
+    info["weight"] = None
+
+    # Normalize non-breaking spaces to regular spaces
+    def normalize(text):
+      return text.replace("\u00a0", " ").strip()
+
+    pattern = re.compile(r"^\d+-\d+,\s*\d+lb")
+    elements = self.findList(By.XPATH, "//p[contains(., 'lb')]")
+
+    for elem in elements:
+      text = normalize(elem.text)
+      if pattern.match(text):
+        parts = text.split(",", 1)
+        if len(parts) == 2:
+          h = parts[0].strip()
+          w = parts[1].strip()
+
+          if "(" in w:
+            w = w.split("(", 1)[0].strip()
+
+          info["height"] = h
+          info["weight"] = w
+      break  # stop at first match
+
+    # --- Birth ---
+    try:
+      birth_p = self.dvr.find_element(By.XPATH, "//p[strong[normalize-space()='Born:']]").text
+      birth_p = birth_p.replace("Born:", "").strip()
+      d,p = birth_p.split("in", 1)
+      d = d.strip()
+      p = p.strip()
+      parts = p.strip().split()
+      if parts[-1].lower() == "us":
+        parts[-1] = "US"
+      p = " ".join(parts)
+      d = re.sub(r"\s*\(.*?\)", "", d).strip()
+      info["birth_date"]  = d
+      info["birth_place"] = p
+    except:
+      info["birth_date"]  = None
+      info["birth_place"] = None
+
+    # --- Death (optional check) ---
+    age_text = None
+
+    try:
+      death_p = self.dvr.find_element(By.XPATH, "//p[strong/a[text()='Died:']]")
+      text = death_p.text.strip()
+
+      # --- Parse death date ---
+      try:
+        date_text = text.replace("Died:", "").strip()
+        date_text = re.sub(r"\s*\(.*", "", date_text)
+        info["death_date"] = date_text
+      except Exception as e:
+        info["death_date"] = None
+
+      # --- Parse death place ---
+      try:
+        if "in" in text:
+          _, p = text.split("in", 1)
+          p = p.strip()
+          parts = p.split()
+          if parts and parts[-1].lower() == "us":
+            parts[-1] = "US"
+          info["death_place"] = " ".join(parts)
+        else:
+          info["death_place"] = None
+      except Exception as e:
+        info["death_place"] = None
+
+      # --- Parse age ---
+      try:
+        age_nobr = death_p.find_element(By.XPATH, ".//nobr").text
+        age_text = age_nobr.strip("()").replace("Aged", "").strip()
+        info["age"] = int(age_text.split("-")[0])  # also populates age_years
+      except Exception as e:
+        info["age"] = None
+
+    except Exception as e:
+      pass
+
+    # --- Age ---
+    if not age_text:
+      # Try to extract age from birth date (if still alive)
+      try:
+        birth_p = self.dvr.find_element(By.XPATH, "//p[strong/a[text()='Born:']]")
+        age_nobr = birth_p.find_element(By.XPATH, ".//nobr").text  # (Age: 47-197d)
+        age_text = age_nobr.strip("()").replace("Age:", "").strip()
+      except:
+        pass
+
+    # Parse just the year portion (e.g., "79" from "79-297d")
+    if age_text:
+      try:
+        age_years = int(age_text.split("-")[0])
+        info["age"] = age_years
+      except ValueError:
+        pass
+
+    # --- Hall of Fame ---
+    elem = self.find(By.XPATH, "//div[@id='meta']//p[.//a[contains(@href, '/awards/hof.shtml')]]")
+    if elem is None:
+      # Fallback: text contains "Hall of Fame" anywhere inside the <p>
+      elem = self.find(By.XPATH, "//div[@id='meta']//p[contains(., 'Hall of Fame')]")
+
+    if elem is not None:
+      # innerText is often more reliable than .text for nested nodes
+      hof_text = elem.get_attribute("innerText")
+      info['hall_of_fame'] = hof_text.strip()
+    else:
+      info['hall_of_fame'] = None
+
+    # --- Nickname ---
+    try:
+      nickname_text = self.find(By.XPATH, "//p[strong[text()='Nicknames:']]").text
+      info['nickname'] = nickname_text.replace("Nicknames:", "").strip()
+    except:
+      info['nickname'] = None
+
+    # --- Full Name ---
+    try :
+      full_name_text = self.find(By.XPATH, "//p[strong[text()='Full Name:']]").text
+      info['full_name'] = full_name_text.replace("Full Name:", "").strip()
+    except:
+      info['full_name'] = None
+
+    return info    
+
+  def playerInsert(self, uid, record):
+    columns = [
+      'uid', 'name', 'positions', 'bats', 'throws', 'height', 'weight',
+      'birth_date', 'birth_place', 'death_date', 'death_place',
+      'age', 'hall_of_fame', 'full_name', 'nickname'
+    ]
+
+    # Start values with uid
+    values = [uid] + [record.get(col, None) for col in columns[1:]]
+
+    # Build SQL
+    placeholders = ', '.join(['?'] * len(columns))
+    column_list = ', '.join(columns)
+    sql = f'INSERT OR REPLACE INTO players ({column_list}) VALUES ({placeholders})'
+
+    self.dbh.execute(sql, values)
+    self.dbh.commit()
+
+  def battingInsert(self, record):
+    # Skip rows with no season or with consolidated team entries like "2TM", "3TM", etc.
+    if not record.get("Season") or re.match(r"^\d+TM$", record.get("Team", "")):
+      return
+
+    columns = [
+      "uid", "season", "age", "team", "lg", "war", "g", "pa", "ab", "r", "h", "doubles", "triples", "hr", "rbi", "sb",
+      "bb", "so", "ba", "obp", "slg", "ops", "opsplus", "roba", "rbatplus", "tb", "hbp", "sh", "pos", "awards"
+    ]
+
+    mapping = {
+      'uid': 'uid',
+      'Season': 'season',
+      'Age': 'age',
+      'Team': 'team',
+      'Lg': 'lg',
+      'WAR': 'war',
+      'G': 'g',
+      'PA': 'pa',
+      'AB': 'ab',
+      'R': 'r',
+      'H': 'h',
+      '2B': 'doubles',
+      '3B': 'triples',
+      'HR': 'hr',
+      'RBI': 'rbi',
+      'SB': 'sb',
+      'BB': 'bb',
+      'SO': 'so',
+      'BA': 'ba',
+      'OBP': 'obp',
+      'SLG': 'slg',
+      'OPS': 'ops',
+      'OPS+': 'opsplus',
+      'ROBA': 'roba',
+      'RBAT+': 'rbatplus',
+      'TB': 'tb',
+      'HBP': 'hbp',
+      'SH': 'sh',
+      'Pos': 'pos',
+      'Awards': 'awards'
+    }
+
+    values = []
+    for col in columns:
+      source_key = next((k for k, v in mapping.items() if v == col), None)
+      val = record.get(source_key) if source_key else None
+      values.append(None if val == "" else val)
+  
+    placeholders = ",".join("?" for _ in columns)
+    update_clause = ", ".join([f"{col} = excluded.{col}" for col in columns if col not in ('uid', 'season', 'team')])
+
+    sql = f"""
+    INSERT INTO batting ({','.join(columns)})
+    VALUES ({placeholders})
+    ON CONFLICT(uid, season, team) DO UPDATE SET
+    {update_clause}
+    """
+
+    try:
+      self.dbh.execute(sql, values)
+      self.dbh.commit()
+    except Exception as e:
+      print(f"Error inserting batting record for {record.get('uid')}: {e}")
+      return False
+    return True
+
+  def pitchingInsert(self, record):
+    if not record.get("Season") or record.get("Team", "").endswith("TM"):
+      return
+
+    columns = [
+      "uid", "season", "age", "team", "lg", "war", "w", "l", "era", "g", "gs", "gf", "sv", "ip",
+      "h", "r", "er", "hr", "bb", "so", "whip", "hbp", "bk", "wp", "bf", "era_plus", "fip"
+    ]
+
+    mapping = {
+      'uid': 'uid',
+      'Season': 'season',
+      'Age': 'age',
+      'Team': 'team',
+      'Lg': 'lg',
+      'WAR': 'war',
+      'W': 'w',
+      'L': 'l',
+      'ERA': 'era',
+      'G': 'g',
+      'GS': 'gs',
+      'GF': 'gf',
+      'SV': 'sv',
+      'IP': 'ip',
+      'H': 'h',
+      'R': 'r',
+      'ER': 'er',
+      'HR': 'hr',
+      'BB': 'bb',
+      'SO': 'so',
+      'WHIP': 'whip',
+      'HBP': 'hbp',
+      'BK': 'bk',
+      'WP': 'wp',
+      'BF': 'bf',
+      'ERA+': 'era_plus',
+      'FIP': 'fip',
+    }
+
+    values = []
+    for col in columns:
+      key = next((k for k, v in mapping.items() if v == col), None)
+      val = record.get(key) if key else None
+      if val == "":
+        val = None
+      values.append(val)
+
+    placeholders = ",".join("?" for _ in columns)
+    sql = f"INSERT OR REPLACE INTO pitching ({','.join(columns)}) VALUES ({placeholders})"
+
+    try:
+      self.dbh.execute(sql, values)
+      self.dbh.commit()
+    except Exception as e:
+      print(f"Error inserting pitching record for {record.get('uid')}: {e}")
+      return False
+    return True
+
+  def nextRecord(self):
+    now = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+    sql = '''
+      WITH next AS (
+        SELECT uid FROM reference
+        WHERE state = 0
+        ORDER BY inserted ASC
+        LIMIT 1
+      )
+      UPDATE reference
+      SET parsed = ?
+      WHERE uid IN (SELECT uid FROM next)
+      RETURNING uid, url, attempts
+    '''
+    csr = self.dbh.execute(sql, (now,))
+    row = csr.fetchone()
+    return dict(zip(['uid', 'url', 'attempts'], row)) if row else None
+
+  def _create_additional_tables(self):
+    self.dbh.execute("""
+      CREATE TABLE IF NOT EXISTS "players" (
+        uid          INTEGER PRIMARY KEY,
+        name         VARCHAR(256),
+        positions    VARCHAR(128),
+        bats         VARCHAR(32),
+        throws       VARCHAR(32),
+        height       VARCHAR(16),
+        weight       VARCHAR(16),
+        birth_date   VARCHAR(16),
+        birth_place  VARCHAR(256),
+        death_date   VARCHAR(16),
+        death_place  VARCHAR(256),
+        age          VARCHAR(32),
+        hall_of_fame VARCHAR(64),
+        full_name    VARCHAR(256),
+        nickname     VARCHAR(256)
+      );
+    """)
+    self.dbh.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_players_uid ON players(uid)")
+    self.dbh.execute("""
+      CREATE TABLE IF NOT EXISTS "batting" (
+        uid        INTEGER,
+        season     INTEGER,
+        age        INTEGER, 
+        team       VARCHAR(4), 
+        lg         VARCHAR(4), 
+        war        DECIMAL(4,2),
+        g          INTEGER, 
+        pa         INTEGER, 
+        ab         INTEGER,
+        r          INTEGER,
+        h          INTEGER,
+        doubles    INTEGER, 
+        triples    INTEGER,
+        hr         INTEGER, 
+        rbi        INTEGER, 
+        sb         INTEGER, 
+        bb         INTEGER, 
+        so         INTEGER, 
+        ba         DECIMAL(4.4), 
+        obp        DECIMAL(1,4), 
+        slg        DECIMAL(1,4), 
+        ops        DECIMAL(1,4), 
+        opsplus    DECIMAL(1,4), 
+        roba       DECIMAL(1,4), 
+        rbatplus   INTEGER,
+        tb         INTEGER, 
+        hbp        INTEGER,
+        sh         INTEGER, 
+        pos        VARCHAR(64), 
+        awards     VARCHAR(256),
+        PRIMARY KEY (uid, season, team)
+      );
+    """)
+    self.dbh.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_batting_uid_season_team ON batting(uid, season, team)")
+    self.dbh.execute("""
+      CREATE TABLE IF NOT EXISTS pitching (
+        uid INTEGER,
+        season INTEGER,
+        age TEXT,
+        team TEXT,
+        lg TEXT,
+        war REAL,
+        w INTEGER,
+        l INTEGER,
+        era REAL,
+        g INTEGER,
+        gs INTEGER,
+        gf INTEGER,
+        sv INTEGER,
+        ip TEXT,             -- Usually "innings pitched" in decimal format (like 187.2)
+        h INTEGER,
+        r INTEGER,
+        er INTEGER,
+        hr INTEGER,
+        bb INTEGER,
+        so INTEGER,
+        whip REAL,
+        hbp INTEGER,
+        bk INTEGER,
+        wp INTEGER,
+        bf INTEGER,
+        era_plus INTEGER,
+        fip REAL,
+        PRIMARY KEY (uid, season, team)
+     );
+    """)
+    self.dbh.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_pitching_uid_season_team ON pitching(uid, season, team)")
+
+if __name__ == '__main__':
+  parser = argparse.ArgumentParser(
+    prog            = os.path.basename(__file__),
+    description     = 'Harvest data from Baseball Reference',
+    formatter_class = lambda prog: argparse.RawTextHelpFormatter(prog,max_help_position=72)
+  )
+  parser.add_argument(
+    '-l',
+    '--locate',
+    dest     = 'locate',
+    default  = False,
+    action   = 'store_true',
+    help     = 'Locate new players in Baseball Reference',
+  )
+  parser.add_argument(
+    '-u',
+    '--url',
+    type     = str,
+    default  = None,
+    required = False,
+    metavar  = 'url',
+    help     = (
+      "Parse a single url file: -u/--url='https://www.baseball-reference.com/players/k/kinerra01.shtml'"
+    )
+  )
+  parser.add_argument(
+    '-v',
+    '--verbose',
+    dest     = 'verbose',
+    default  = False,
+    action   = 'store_true',
+    help     = 'Turn on verbose output',
+  )
+
+  args  = parser.parse_args()
+  if args.verbose == True:
+    verbose = True
+
+  try:
+    Baseball(args);
+  except KeyboardInterrupt:
+    print(" Quitting...")
+  try:
+    sys.exit(0)
+  except SystemExit:
+    os._exit(0)
