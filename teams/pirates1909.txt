@@ -1,0 +1,11 @@
+Team: 1909 Pittsbugh Pirates
+Bobby Byrne   # 3B
+Tommy Leach   # CF
+Fred Clarke   # LF
+Honus Wagner  # SS
+Dots Miller   # 2B
+Bill Abstein  # 1B
+Owen Wilson   # RF
+George Gibson # C
+Babe Adams    # P 
+

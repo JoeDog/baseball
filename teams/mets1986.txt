@@ -1,0 +1,10 @@
+Team: 1986 New York Mets
+Mookie Wilson     # LF
+Lenny Dykstra     # CF
+Keith Hernandez   # 1B
+Gary Carter       # C
+Darryl Strawberry # RF
+Ray Knight        # 3B
+Tim Teufel        # 2B
+Rafael Santana    # SS
+Ron Darling       # P

@@ -1,0 +1,10 @@
+Team: 1986 Boston Red Sox
+Wade Boggs     # 3B
+Marty Barrett  # 2B
+Bill Buckner   # 1B
+Jim Rice       # LF
+Dwight Evans   # RF
+Rich Gedman    # C
+Dave Henderson # CF
+Spike Owen     # SS
+Bruce Hurst    # P
