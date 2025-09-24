@@ -1,4 +1,4 @@
-#!/opt/homebrew/bin/python3
+#!/usr/bin/env python3
 import os
 import re
 import csv
@@ -7,7 +7,6 @@ import time
 import argparse
 import requests
 import random
-import datetime
 import traceback
 import psutil
 import shutil
@@ -18,6 +17,7 @@ import tempfile
 import atexit
 import weakref
 
+from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
@@ -314,7 +314,7 @@ class Spider(object):
 
 
   def nextRecord(self):
-    now = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+    now = datetime.now().isoformat(sep=' ', timespec='seconds')
     sql = '''
       WITH next AS (
         SELECT uid FROM reference
@@ -341,7 +341,7 @@ class Spider(object):
   def addUrl(self, url):
     self.dbh.execute(
       "INSERT OR IGNORE INTO reference (url, state, discovered) VALUES (?, ?, ?)",
-      (url, 0, datetime.datetime.now().isoformat(sep=' '))
+      (url, 0, datetime.now().isoformat(sep=' '))
     )
     self.dbh.commit()
     return True
@@ -393,6 +393,9 @@ class Baseball(Spider):
     if self.args.locate:
       self.locate()
       exit(0)
+
+    if self.args.update:
+      self._update_records()
 
     rec = self.nextRecord()
     itr = 0
@@ -483,7 +486,7 @@ class Baseball(Spider):
     self.dbh.commit()
 
     if okay:
-      self.dbh.execute("UPDATE reference SET inserted = ? WHERE uid = ?",(datetime.datetime.now().isoformat(sep=' '), rec["uid"]))
+      self.dbh.execute("UPDATE reference SET inserted = ? WHERE uid = ?",(datetime.now().isoformat(sep=' '), rec["uid"]))
       self.dbh.commit()
 
   def skip(self, uid):
@@ -821,7 +824,7 @@ class Baseball(Spider):
     return True
 
   def nextRecord(self):
-    now = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+    now = datetime.now().isoformat(sep=' ', timespec='seconds')
     sql = '''
       WITH next AS (
         SELECT uid FROM reference
@@ -837,6 +840,18 @@ class Baseball(Spider):
     csr = self.dbh.execute(sql, (now,))
     row = csr.fetchone()
     return dict(zip(['uid', 'url', 'attempts'], row)) if row else None
+
+  def _update_records(self):
+    year = datetime.now().year
+    tbls = ["pitching", "batting"]
+    for tbl in tbls:
+      csr  = self.dbh.execute("SELECT uid FROM {} WHERE season>={}".format(tbl, year-3))
+      row  = csr.fetchall() 
+      for u in row:
+        uid = int(u[0])
+        sql = "UPDATE reference SET state=0 WHERE uid={}".format(uid)
+        csr = self.dbh.execute(sql)
+        self.dbh.commit()
 
   def _create_additional_tables(self):
     self.dbh.execute("""
@@ -953,6 +968,14 @@ if __name__ == '__main__':
     help     = (
       "Parse a single url file: -u/--url='https://www.baseball-reference.com/players/k/kinerra01.shtml'"
     )
+  )
+  parser.add_argument(
+    '-U',
+    '--update',
+    dest     = 'update',
+    default  = False,
+    action   = 'store_true',
+    help     = 'Update stats with most recent data available',
   )
   parser.add_argument(
     '-v',
