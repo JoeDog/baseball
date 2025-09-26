@@ -11,11 +11,14 @@ import traceback
 import psutil
 import shutil
 import signal
-import sqlite3
 import urllib3
 import tempfile
 import atexit
 import weakref
+try:
+  import pysqlite3.dbapi2 as sqlite3
+except ImportError:
+  import sqlite3
 
 from datetime import datetime
 from selenium import webdriver
@@ -312,24 +315,34 @@ class Spider(object):
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reference_url_unique ON reference(url)")
     return conn 
 
-
   def nextRecord(self):
     now = datetime.now().isoformat(sep=' ', timespec='seconds')
-    sql = '''
-      WITH next AS (
-        SELECT uid FROM reference
+    cur = self.dbh.cursor()
+    cur.execute("BEGIN IMMEDIATE")
+    row = cur.execute(
+        """
+        SELECT rowid, uid, url, attempts
+        FROM reference
         WHERE state = 0
         ORDER BY inserted ASC
         LIMIT 1
-      )
-      UPDATE reference
-      SET state = 1, parsed = ?
-      WHERE uid IN (SELECT uid FROM next)
-      RETURNING uid, url, attempts
-    '''
-    csr = self.dbh.execute(sql, (now,))
-    row = csr.fetchone()
-    return dict(zip(['uid', 'url', 'attempts'], row)) if row else None
+        """
+    ).fetchone()
+
+    if not row:
+      self.dbh.rollback()
+      return None
+
+    rowid, uid, url, attempts = row
+    cur.execute("UPDATE reference SET parsed = ? WHERE rowid = ?", (now, rowid))
+    self.dbh.commit()
+    return {"uid": uid, "url": url, "attempts": attempts}
+
+  def recordCount(self):
+    row = self.dbh.execute("SELECT count(*) FROM reference").fetchone()
+    if len(row) > 0:
+      return int(row[0])
+    return 0
 
   def isNew(self, url):
     rows = self.dbh.execute("SELECT uid FROM reference WHERE url='{}'".format(url)).fetchall()
@@ -390,9 +403,8 @@ class Baseball(Spider):
         self.process(rec)
       exit(0)
  
-    if self.args.locate:
+    if self.args.locate or self.recordCount() == 0:
       self.locate()
-      exit(0)
 
     if self.args.update:
       self._update_records()
@@ -822,24 +834,6 @@ class Baseball(Spider):
       print(f"Error inserting pitching record for {record.get('uid')}: {e}")
       return False
     return True
-
-  def nextRecord(self):
-    now = datetime.now().isoformat(sep=' ', timespec='seconds')
-    sql = '''
-      WITH next AS (
-        SELECT uid FROM reference
-        WHERE state = 0
-        ORDER BY inserted ASC
-        LIMIT 1
-      )
-      UPDATE reference
-      SET parsed = ?
-      WHERE uid IN (SELECT uid FROM next)
-      RETURNING uid, url, attempts
-    '''
-    csr = self.dbh.execute(sql, (now,))
-    row = csr.fetchone()
-    return dict(zip(['uid', 'url', 'attempts'], row)) if row else None
 
   def _update_records(self):
     year = datetime.now().year
