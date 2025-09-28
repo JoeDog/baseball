@@ -96,6 +96,9 @@ class Spider(object):
       finally:
         signal.alarm(0)
 
+    uid = self.findUID(url)
+    if uid > 0:
+      self.mark_failed(uid)
     return False
 
   def wait(self, attr, selector, seconds=20):
@@ -186,6 +189,10 @@ class Spider(object):
     except Exception as e:
       return []
 
+  def findUID(self, url)->int:
+    (n,) = self.dbh.execute("SELECT uid FROM reference WHERE url='{}'".format(url)).fetchone()
+    return int(n or 0)
+
   def _initDriver(self):
     print("Initializing WebDriver...")
     self.tmp = tempfile.mkdtemp()
@@ -240,7 +247,6 @@ class Spider(object):
     # Gracefully quit driver if possible
     try:
       if hasattr(self, "dvr") and self.dvr:
-        print("Calling driver.quit()")
         self.dvr.quit()
       if hasattr(self, "dvr") and self.dvr.service:
         print("Calling driver.service.stop()")
@@ -272,22 +278,18 @@ class Spider(object):
       except (psutil.NoSuchProcess, psutil.AccessDenied):
         continue
 
-    # Kill collected PIDs
     for pid in pids_to_kill:
       try:
         proc = psutil.Process(pid)
-        print(f"Killing PID {pid} ({proc.name()})")
         proc.kill()
       except psutil.NoSuchProcess:
         pass
       except Exception as e:
         print(f"Error killing PID {pid}: {e}")
 
-    # Clean up temporary Chrome profile if defined
     if hasattr(self, "tmp"):
       try:
         shutil.rmtree(self.tmp, ignore_errors=True)
-        print(f"Deleted temp profile at {self.tmp}")
       except Exception as e:
         print(f"Error deleting temp profile: {e}")
 
@@ -296,29 +298,61 @@ class Spider(object):
     self.dvr = self._initDriver()
 
   def _initDB(self):
-    conn = sqlite3.connect(self.dbf) # Use ":memory:" for in-RAM DB
+    conn = sqlite3.connect(self.dbf)
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+
+    # Try WAL; if the underlying FS doesn’t support it, ignore the failure
+    try:
+      conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+      pass
+    conn.execute("PRAGMA synchronous=NORMAL")
+
     conn.execute("""
-      CREATE TABLE IF NOT EXISTS "reference" (
-        uid        INTEGER PRIMARY KEY,
-        lookup     VARCHAR(50),
-        url        VARCHAR(500),
-        state      INTEGER DEFAULT 0,
-        columns    TEXT,
-        attempts   INTEGER DEFAULT 0,
-        discovered TIMESTAMP,
-        inserted   TIMESTAMP,
-        parsed     TIMESTAMP,
-        success    TIMESTAMP,
-        failed     TIMESTAMP
+      CREATE TABLE IF NOT EXISTS reference (
+        uid         INTEGER PRIMARY KEY,
+        lookup      TEXT,
+        url         TEXT NOT NULL,
+        state       INTEGER NOT NULL DEFAULT 0,
+        schema_json TEXT,
+        attempts    INTEGER NOT NULL DEFAULT 0,
+        discovered  TEXT,
+        last_seen   TEXT,
+        inserted    TEXT NOT NULL DEFAULT (datetime('now')),
+        parsed      TEXT,
+        success     TEXT,
+        failed      TEXT,
+        CHECK (state IN (0,1,2,3))
       );
     """)
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reference_url_unique ON reference(url)")
-    return conn 
+
+    conn.execute("""
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_reference_url_unique
+      ON reference(url)
+    """)
+    conn.execute("""
+      CREATE INDEX IF NOT EXISTS idx_reference_state_inserted
+      ON reference(state, inserted)
+    """)
+    conn.execute("""
+      CREATE INDEX IF NOT EXISTS idx_reference_last_seen 
+      ON reference(last_seen)
+    """)
+    conn.execute("""
+      CREATE INDEX IF NOT EXISTS idx_ref_q_on_inserted
+      ON reference(inserted)
+      WHERE state = 0
+    """)
+    return conn
 
   def nextRecord(self):
     now = datetime.now().isoformat(sep=' ', timespec='seconds')
     cur = self.dbh.cursor()
-    cur.execute("BEGIN IMMEDIATE")
+    for _ in range(5):
+      try:
+        cur.execute("BEGIN IMMEDIATE"); break
+      except sqlite3.OperationalError: time.sleep(0.05)
     row = cur.execute(
         """
         SELECT rowid, uid, url, attempts
@@ -338,20 +372,57 @@ class Spider(object):
     self.dbh.commit()
     return {"uid": uid, "url": url, "attempts": attempts}
 
-  def recordCount(self):
-    row = self.dbh.execute("SELECT count(*) FROM reference").fetchone()
-    if len(row) > 0:
-      return int(row[0])
-    return 0
+  def recordCount(self)->int:
+    (n,) = self.dbh.execute("SELECT COUNT(*) FROM reference").fetchone()
+    return int(n or 0)
 
-  def isNew(self, url):
+  def iso_now(self):
+    return datetime.now().isoformat(sep=' ', timespec='seconds')
+
+  def mark_reset(self, uid):
+    now = self.iso_now()
+    self.dbh.execute("""
+      UPDATE reference
+      SET state=0
+      WHERE uid=?
+    """, (uid))
+    self.dbh.commit()
+
+  def mark_done(self, uid):
+    now = self.iso_now()
+    self.dbh.execute("""
+      UPDATE reference
+      SET state=1, success=?, last_seen=?
+      WHERE uid=?
+    """, (now, now, uid))
+    self.dbh.commit()
+
+  def mark_failed(self, uid):
+    now = self.iso_now()
+    self.dbh.execute("""
+      UPDATE reference
+      SET state=2, failed=?, last_seen=COALESCE(last_seen, ?)
+      WHERE uid=?
+    """, (now, now, uid))
+    self.dbh.commit()
+
+  def mark_checked(self, uid):
+    now = self.iso_now()
+    self.dbh.execute("""
+      UPDATE reference
+      SET parsed=?, last_seen=?
+      WHERE uid=?
+    """, (now, now, uid))
+    self.dbh.commit()
+
+  def isNew(self, url:str):
     rows = self.dbh.execute("SELECT uid FROM reference WHERE url='{}'".format(url)).fetchall()
     for (uid,) in rows:
       if uid > 0: 
         return False
     return True
 
-  def addUrl(self, url):
+  def addUrl(self, url:str)->bool:
     self.dbh.execute(
       "INSERT OR IGNORE INTO reference (url, state, discovered) VALUES (?, ?, ?)",
       (url, 0, datetime.now().isoformat(sep=' '))
@@ -359,7 +430,7 @@ class Spider(object):
     self.dbh.commit()
     return True
 
-  def handleUrl(self, url:str):
+  def handleUrl(self, url:str)->int:
     self.addUrl(url)
     uid = None
     sql = "SELECT uid FROM reference WHERE url='{}'".format(url)
@@ -412,6 +483,7 @@ class Baseball(Spider):
     rec = self.nextRecord()
     itr = 0
     while rec:
+      print(self.findUID(rec["url"]))
       self.process(rec)
       rec = self.nextRecord()
       time.sleep(random.uniform(8, 22))
@@ -498,14 +570,9 @@ class Baseball(Spider):
     self.dbh.commit()
 
     if okay:
-      self.dbh.execute("UPDATE reference SET inserted = ? WHERE uid = ?",(datetime.now().isoformat(sep=' '), rec["uid"]))
-      self.dbh.commit()
-
-  def skip(self, uid):
-    sql = "UPDATE reference SET state = 2 WHERE uid={}".format(uid)
-    self.dbh.execute(sql)
-    self.dbh.commit()
-    return 
+      self.mark_done(rec["uid"])
+    else:
+      self.mark_failed(rec["uid"])
 
   def info(self):
     info = {}
@@ -721,36 +788,36 @@ class Baseball(Spider):
     ]
 
     mapping = {
-      'uid': 'uid',
-      'Season': 'season',
-      'Age': 'age',
-      'Team': 'team',
-      'Lg': 'lg',
-      'WAR': 'war',
-      'G': 'g',
-      'PA': 'pa',
-      'AB': 'ab',
-      'R': 'r',
-      'H': 'h',
-      '2B': 'doubles',
-      '3B': 'triples',
-      'HR': 'hr',
-      'RBI': 'rbi',
-      'SB': 'sb',
-      'BB': 'bb',
-      'SO': 'so',
-      'BA': 'ba',
-      'OBP': 'obp',
-      'SLG': 'slg',
-      'OPS': 'ops',
-      'OPS+': 'opsplus',
-      'ROBA': 'roba',
-      'RBAT+': 'rbatplus',
-      'TB': 'tb',
-      'HBP': 'hbp',
-      'SH': 'sh',
-      'Pos': 'pos',
-      'Awards': 'awards'
+      'uid'    : 'uid',
+      'Season' : 'season',
+      'Age'    : 'age',
+      'Team'   : 'team',
+      'Lg'     : 'lg',
+      'WAR'    : 'war',
+      'G'      : 'g',
+      'PA'     : 'pa',
+      'AB'     : 'ab',
+      'R'      : 'r',
+      'H'      : 'h',
+      '2B'     : 'doubles',
+      '3B'     : 'triples',
+      'HR'     : 'hr',
+      'RBI'    : 'rbi',
+      'SB'     : 'sb',
+      'BB'     : 'bb',
+      'SO'     : 'so',
+      'BA'     : 'ba',
+      'OBP'    : 'obp',
+      'SLG'    : 'slg',
+      'OPS'    : 'ops',
+      'OPS+'   : 'opsplus',
+      'ROBA'   : 'roba',
+      'RBAT+'  : 'rbatplus',
+      'TB'     : 'tb',
+      'HBP'    : 'hbp',
+      'SH'     : 'sh',
+      'Pos'    : 'pos',
+      'Awards' : 'awards'
     }
 
     values = []
@@ -759,7 +826,7 @@ class Baseball(Spider):
       val = record.get(source_key) if source_key else None
       values.append(None if val == "" else val)
   
-    placeholders = ",".join("?" for _ in columns)
+    placeholders  = ",".join("?" for _ in columns)
     update_clause = ", ".join([f"{col} = excluded.{col}" for col in columns if col not in ('uid', 'season', 'team')])
 
     sql = f"""
@@ -787,33 +854,33 @@ class Baseball(Spider):
     ]
 
     mapping = {
-      'uid': 'uid',
-      'Season': 'season',
-      'Age': 'age',
-      'Team': 'team',
-      'Lg': 'lg',
-      'WAR': 'war',
-      'W': 'w',
-      'L': 'l',
-      'ERA': 'era',
-      'G': 'g',
-      'GS': 'gs',
-      'GF': 'gf',
-      'SV': 'sv',
-      'IP': 'ip',
-      'H': 'h',
-      'R': 'r',
-      'ER': 'er',
-      'HR': 'hr',
-      'BB': 'bb',
-      'SO': 'so',
-      'WHIP': 'whip',
-      'HBP': 'hbp',
-      'BK': 'bk',
-      'WP': 'wp',
-      'BF': 'bf',
-      'ERA+': 'era_plus',
-      'FIP': 'fip',
+      'uid'    : 'uid',
+      'Season' : 'season',
+      'Age'    : 'age',
+      'Team'   : 'team',
+      'Lg'     : 'lg',
+      'WAR'    : 'war',
+      'W'      : 'w',
+      'L'      : 'l',
+      'ERA'    : 'era',
+      'G'      : 'g',
+      'GS'     : 'gs',
+      'GF'     : 'gf',
+      'SV'     : 'sv',
+      'IP'     : 'ip',
+      'H'      : 'h',
+      'R'      : 'r',
+      'ER'     : 'er',
+      'HR'     : 'hr',
+      'BB'     : 'bb',
+      'SO'     : 'so',
+      'WHIP'   : 'whip',
+      'HBP'    : 'hbp',
+      'BK'     : 'bk',
+      'WP'     : 'wp',
+      'BF'     : 'bf',
+      'ERA+'   : 'era_plus',
+      'FIP'    : 'fip',
     }
 
     values = []
@@ -843,9 +910,7 @@ class Baseball(Spider):
       row  = csr.fetchall() 
       for u in row:
         uid = int(u[0])
-        sql = "UPDATE reference SET state=0 WHERE uid={}".format(uid)
-        csr = self.dbh.execute(sql)
-        self.dbh.commit()
+        self.mark_reset(uid)
 
   def _create_additional_tables(self):
     self.dbh.execute("""
