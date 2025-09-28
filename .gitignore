@@ -154,10 +154,16 @@ venv.bak/
 # mkdocs documentation
 /site
 
+page_dump.html
+
 # mypy
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# sqlite
+*.db-wal
+*.db-shm
 
 # Pyre type checker
 .pyre/
